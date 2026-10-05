@@ -9,6 +9,7 @@ on FreePBX / Asterisk PJSIP.
 Subcommands
 -----------
   collect     Собрать список IP Yealink-телефонов в файл
+  list        Показать таблицу: extension / IP / модель / прошивка
   test        Отправить Reboot на один IP (для проверки)
   reboot      Массовая перезагрузка через Action URI
   autop       Массовый запуск автонастройки через Action URI (AutoP)
@@ -18,10 +19,13 @@ Run `yealink_manager.py <subcommand> -h` for details.
 """
 import argparse
 import getpass
+import ipaddress
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -33,6 +37,8 @@ except ImportError:
     print("[!] Требуется библиотека 'requests'. Установите: pip3 install requests")
     sys.exit(1)
 
+
+__version__ = "0.2.0"
 
 # ------------------------------------------------------------------ #
 #  Константы                                                          #
@@ -69,32 +75,51 @@ def run_asterisk(cmd, timeout=60):
 # ------------------------------------------------------------------ #
 #  Парсинг AstDB                                                      #
 # ------------------------------------------------------------------ #
+def parse_ua(ua):
+    """'Yealink SIP-T33G 124.86.0.75' -> ('T33G', '124.86.0.75')."""
+    tokens = ua.split()
+    if tokens and tokens[0].lower() == "yealink":
+        tokens = tokens[1:]
+    firmware = ""
+    if tokens and re.fullmatch(r"\d+(\.\d+)+", tokens[-1]):
+        firmware = tokens.pop()
+    model = " ".join(tokens)
+    for prefix in ("SIP-", "SIP "):
+        if model.startswith(prefix):
+            model = model[len(prefix):]
+    return model or "?", firmware or "?"
+
+
 def _walk_contact(obj, aor, found):
     """Рекурсивно ищет via_addr/user_agent в JSON-объекте любой вложенности."""
     if isinstance(obj, dict):
         if "via_addr" in obj:
             ua = obj.get("user_agent", "")
             if isinstance(ua, str) and "yealink" in ua.lower():
-                # Имя endpoint берём из JSON, AOR из ключа — запасной вариант
-                ext = obj.get("endpoint") or aor
-                found.setdefault(ext, []).append(
-                    {"ip": obj.get("via_addr"), "ua": ua}
-                )
+                model, firmware = parse_ua(ua)
+                found.append({
+                    # Имя endpoint берём из JSON, AOR из ключа — запасной вариант
+                    "ext": obj.get("endpoint") or aor,
+                    "ip": obj.get("via_addr"),
+                    "ua": ua,
+                    "model": model,
+                    "firmware": firmware,
+                })
             return
         for v in obj.values():
             _walk_contact(v, aor, found)
 
 
-def collect_yealink():
+def parse_contacts(out):
     """
-    Возвращает dict: {'4001': [{'ip': '192.168.1.100', 'ua': 'Yealink ...'}], ...}
-    На одном endpoint может быть несколько контактов (max_contacts > 1).
+    Разбирает вывод `database show registrar contact`.
+    Возвращает (contacts, total, parsed), где contacts — список dict:
+    {'ext', 'ip', 'ua', 'model', 'firmware'}. На одном endpoint может быть
+    несколько контактов (max_contacts > 1).
     Endpoint берётся из поля "endpoint" в JSON, иначе из ключа AstDB:
     /registrar/contact/<aor>;@<hash>
     """
-    print("[*] Запрос к базе данных Asterisk...")
-    out = run_asterisk("database show registrar contact")
-    found = {}
+    found = []
     total = parsed = 0
 
     for line in out.splitlines():
@@ -119,11 +144,80 @@ def collect_yealink():
 
         _walk_contact(data, aor, found)
 
-    contacts = sum(len(v) for v in found.values())
+    return found, total, parsed
+
+
+def collect_yealink():
+    """Читает AstDB и возвращает список контактов Yealink."""
+    print("[*] Запрос к базе данных Asterisk...", file=sys.stderr)
+    contacts, total, parsed = parse_contacts(
+        run_asterisk("database show registrar contact")
+    )
+    exts = {c["ext"] for c in contacts}
     print(f"[*] Строк /registrar/contact/: {total}, "
-          f"распарсено JSON: {parsed}, Yealink найдено: {contacts} "
-          f"(endpoint'ов: {len(found)})")
-    return found
+          f"распарсено JSON: {parsed}, Yealink найдено: {len(contacts)} "
+          f"(endpoint'ов: {len(exts)})", file=sys.stderr)
+    return contacts
+
+
+# ------------------------------------------------------------------ #
+#  Фильтры                                                            #
+# ------------------------------------------------------------------ #
+def parse_ext_filter(spec):
+    """'4001,4010-4020' -> функция-предикат для extension."""
+    exact, ranges = set(), []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            if not (lo.isdigit() and hi.isdigit()):
+                raise argparse.ArgumentTypeError(f"неверный диапазон: {part}")
+            ranges.append((int(lo), int(hi)))
+        else:
+            exact.add(part)
+
+    def match(ext):
+        if ext in exact:
+            return True
+        return ext.isdigit() and any(lo <= int(ext) <= hi for lo, hi in ranges)
+
+    return match
+
+
+def parse_subnets(spec):
+    """'10.1.0.0/16,10.2.0.0/16' -> список ip_network."""
+    try:
+        return [ipaddress.ip_network(s.strip(), strict=False)
+                for s in spec.split(",") if s.strip()]
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e))
+
+
+def ip_in(ip, subnets):
+    try:
+        addr = ipaddress.ip_address(ip)
+    except (TypeError, ValueError):
+        return False
+    return any(addr in net for net in subnets)
+
+
+def has_filters(args):
+    return bool(args.ext or args.model or args.subnet)
+
+
+def filter_contacts(contacts, args):
+    result = []
+    for c in contacts:
+        if args.ext and not args.ext(c["ext"]):
+            continue
+        if args.model and args.model.lower() not in c["model"].lower():
+            continue
+        if args.subnet and not ip_in(c["ip"], args.subnet):
+            continue
+        result.append(c)
+    return result
 
 
 # ------------------------------------------------------------------ #
@@ -211,10 +305,10 @@ def write_file_lines(path, lines):
 
 
 def run_parallel(items, func, workers, title):
-    """Выполняет func для каждого элемента, возвращает число ошибок."""
+    """Выполняет func для каждого элемента, возвращает список неудачных."""
     print(f"\n[*] {title} ({len(items)} шт.)...")
-    ok = fail = 0
-    failed = []
+    ok = 0
+    failed, messages = [], []
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {ex.submit(func, item): item for item in items}
         for fut in as_completed(futures):
@@ -223,15 +317,55 @@ def run_parallel(items, func, workers, title):
                 ok += 1
                 print(f"[+] {msg}")
             else:
-                fail += 1
-                failed.append(msg)
+                failed.append(futures[fut])
+                messages.append(msg)
                 print(f"[-] {msg}")
-    print(f"\n[*] Готово. Успешно: {ok}, Ошибок: {fail}")
-    if failed:
+    print(f"\n[*] Готово. Успешно: {ok}, Ошибок: {len(failed)}")
+    if messages:
         print("[*] Неудачные:")
-        for m in failed:
+        for m in messages:
             print(f"    {m}")
-    return fail
+    return failed
+
+
+def run_bulk(items, func, args, title):
+    """Запуск волнами (--batch/--delay) с сохранением неудачных в файл."""
+    batch = args.batch or len(items)
+    waves = (len(items) + batch - 1) // batch
+    failed = []
+    for n, start in enumerate(range(0, len(items), batch), 1):
+        if n > 1 and args.delay:
+            print(f"\n[*] Пауза {args.delay:g} с перед волной {n}/{waves}...")
+            time.sleep(args.delay)
+        label = title if waves == 1 else f"{title}, волна {n}/{waves}"
+        failed += run_parallel(items[start:start + batch], func,
+                               args.workers, label)
+    if waves > 1:
+        print(f"\n[*] Итого: успешно {len(items) - len(failed)}, "
+              f"ошибок {len(failed)}")
+    if failed and args.failed_file:
+        write_file_lines(args.failed_file, failed)
+        print(f"[*] Неудачные ({len(failed)}) сохранены в {args.failed_file}")
+    return 1 if failed else 0
+
+
+def dry_run(items, action):
+    print(f"[*] DRY RUN: {action} — {len(items)} шт. (ничего не отправляется)")
+    for item in items:
+        print(f"    {item}")
+    return 0
+
+
+def confirm(args, question):
+    """Спрашивает подтверждение; без TTY требует --yes."""
+    if args.yes:
+        return True
+    if not sys.stdin.isatty():
+        print("[!] Нет терминала для подтверждения: добавьте --yes.",
+              file=sys.stderr)
+        return False
+    answer = input(f"{question} [y/N]: ").strip().lower()
+    return answer in ("y", "yes", "д", "да")
 
 
 def resolve_password(args):
@@ -255,18 +389,49 @@ def make_client(args):
     )
 
 
+def action_targets(args):
+    """
+    IP для reboot/autop. С --ext/--model список берётся из AstDB заново
+    (в файле IP нет extension и модели), иначе — из --ips-file.
+    """
+    if args.ext or args.model:
+        contacts = filter_contacts(collect_yealink(), args)
+        return sorted({c["ip"] for c in contacts if c.get("ip")})
+    ips = read_file_lines(args.ips_file)
+    if args.subnet:
+        ips = [ip for ip in ips if ip_in(ip, args.subnet)]
+    return ips
+
+
 # ------------------------------------------------------------------ #
 #  Subcommands                                                        #
 # ------------------------------------------------------------------ #
 def cmd_collect(args):
-    data = collect_yealink()
-    ips = sorted({c["ip"] for contacts in data.values()
-                  for c in contacts if c.get("ip")})
+    contacts = filter_contacts(collect_yealink(), args)
+    ips = sorted({c["ip"] for c in contacts if c.get("ip")})
     if not ips:
         print("[!] Yealink-телефоны не найдены.")
         return 1
     write_file_lines(args.ips_file, ips)
     print(f"[+] Сохранено {len(ips)} IP в {args.ips_file}")
+    return 0
+
+
+def cmd_list(args):
+    contacts = sorted(filter_contacts(collect_yealink(), args),
+                      key=lambda c: (c["ext"], c["ip"] or ""))
+    if args.json:
+        print(json.dumps(contacts, ensure_ascii=False, indent=2))
+        return 0 if contacts else 1
+    if not contacts:
+        print("[!] Yealink-телефоны не найдены.")
+        return 1
+    header = ("EXT", "IP", "MODEL", "FIRMWARE")
+    rows = [(c["ext"], c["ip"] or "?", c["model"], c["firmware"])
+            for c in contacts]
+    widths = [max(len(r[i]) for r in rows + [header]) for i in range(4)]
+    for row in [header] + rows:
+        print("  ".join(v.ljust(w) for v, w in zip(row, widths)).rstrip())
     return 0
 
 
@@ -278,36 +443,45 @@ def cmd_test(args):
     return 0 if ok else 1
 
 
-def cmd_reboot(args):
-    ips = read_file_lines(args.ips_file)
+def _action(args, method, title, question):
+    ips = action_targets(args)
     if not ips:
+        if has_filters(args):
+            print("[!] Под фильтры не попал ни один телефон.")
+        return 1
+    if args.dry_run:
+        return dry_run(ips, title)
+    if not confirm(args, question.format(n=len(ips))):
+        print("[*] Отменено.")
         return 1
     client = make_client(args)
-    fail = run_parallel(ips, client.reboot, args.workers,
-                        "Массовая перезагрузка Yealink")
-    return 1 if fail else 0
+    return run_bulk(ips, getattr(client, method), args, title)
+
+
+def cmd_reboot(args):
+    return _action(args, "reboot", "Массовая перезагрузка Yealink",
+                   "Перезагрузить {n} телефонов?")
 
 
 def cmd_autop(args):
-    ips = read_file_lines(args.ips_file)
-    if not ips:
-        return 1
-    client = make_client(args)
-    fail = run_parallel(ips, client.autoprovision, args.workers,
-                        "Запуск автонастройки (AutoP)")
-    return 1 if fail else 0
+    return _action(args, "autoprovision", "Запуск автонастройки (AutoP)",
+                   "Запустить AutoP на {n} телефонах?")
 
 
 def cmd_provision(args):
-    exts = sorted(collect_yealink().keys())
+    contacts = filter_contacts(collect_yealink(), args)
+    exts = sorted({c["ext"] for c in contacts})
     if not exts:
         print("[!] Yealink-endpoint'ы не найдены.")
         return 1
+    if args.dry_run:
+        return dry_run(exts, "SIP NOTIFY check-sync")
+    if not confirm(args, f"Отправить check-sync на {len(exts)} endpoint'ов?"):
+        print("[*] Отменено.")
+        return 1
     write_file_lines(args.exts_file, exts)
     print(f"[+] Сохранено {len(exts)} extension'ов в {args.exts_file}")
-    workers = args.workers or DEFAULT_WORKERS_PROVISION
-    fail = run_parallel(exts, send_check_sync, workers, "SIP NOTIFY check-sync")
-    return 1 if fail else 0
+    return run_bulk(exts, send_check_sync, args, "SIP NOTIFY check-sync")
 
 
 # ------------------------------------------------------------------ #
@@ -323,6 +497,16 @@ def positive_int(value):
     return n
 
 
+def non_negative_float(value):
+    try:
+        n = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"не число: {value}")
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"должно быть >= 0: {value}")
+    return n
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="yealink_manager.py",
@@ -331,12 +515,16 @@ def build_parser():
         epilog=(
             "Примеры:\n"
             "  yealink_manager.py collect\n"
+            "  yealink_manager.py list --model T33G\n"
             "  yealink_manager.py test 192.168.1.100 -p secret\n"
-            "  yealink_manager.py reboot -w 30 -p secret\n"
-            "  yealink_manager.py autop -p secret\n"
-            "  yealink_manager.py provision\n"
+            "  yealink_manager.py reboot --dry-run\n"
+            "  yealink_manager.py reboot -p secret --batch 50 --delay 30\n"
+            "  yealink_manager.py autop -p secret --ext 4001-4099\n"
+            "  yealink_manager.py provision --yes\n"
         ),
     )
+    p.add_argument("--version", action="version",
+                   version=f"%(prog)s {__version__}")
 
     # Общие опции
     common = argparse.ArgumentParser(add_help=False)
@@ -387,15 +575,69 @@ def build_parser():
         help=f"Файл со списком extension'ов (по умолчанию: {DEFAULT_EXTS_FILE})",
     )
 
+    # Фильтры
+    filters = argparse.ArgumentParser(add_help=False)
+    filters.add_argument(
+        "--ext",
+        type=parse_ext_filter,
+        help="Только эти extension'ы: 4001,4005,4010-4020",
+    )
+    filters.add_argument(
+        "--subnet",
+        type=parse_subnets,
+        help="Только эти подсети: 10.1.0.0/16,10.2.0.0/24",
+    )
+    filters.add_argument(
+        "--model",
+        help="Только модели, содержащие подстроку (без учёта регистра): T33G",
+    )
+
+    # Опции массовых операций
+    bulk = argparse.ArgumentParser(add_help=False)
+    bulk.add_argument(
+        "-n", "--dry-run",
+        action="store_true",
+        help="Показать список целей и ничего не отправлять",
+    )
+    bulk.add_argument(
+        "-y", "--yes",
+        action="store_true",
+        help="Не спрашивать подтверждение (обязательно для cron)",
+    )
+    bulk.add_argument(
+        "--batch",
+        type=positive_int,
+        help="Отправлять волнами по N устройств",
+    )
+    bulk.add_argument(
+        "--delay",
+        type=non_negative_float,
+        default=0,
+        help="Пауза между волнами в секундах (по умолчанию: 0)",
+    )
+    bulk.add_argument(
+        "--failed-file",
+        help="Сохранить неудачные IP/extension'ы в файл для повторного прогона",
+    )
+
     subs = p.add_subparsers(dest="command", required=True)
 
     # collect
     p_collect = subs.add_parser(
         "collect",
-        parents=[common],
+        parents=[common, filters],
         help="Собрать список IP Yealink-телефонов в файл",
     )
     p_collect.set_defaults(func=cmd_collect)
+
+    # list
+    p_list = subs.add_parser(
+        "list",
+        parents=[common, filters],
+        help="Показать таблицу: extension / IP / модель / прошивка",
+    )
+    p_list.add_argument("--json", action="store_true", help="Вывод в JSON")
+    p_list.set_defaults(func=cmd_list)
 
     # test
     p_test = subs.add_parser(
@@ -409,7 +651,7 @@ def build_parser():
     # reboot
     p_reboot = subs.add_parser(
         "reboot",
-        parents=[common],
+        parents=[common, filters, bulk],
         help="Массовая перезагрузка через Action URI",
     )
     p_reboot.set_defaults(func=cmd_reboot)
@@ -417,7 +659,7 @@ def build_parser():
     # autop
     p_autop = subs.add_parser(
         "autop",
-        parents=[common],
+        parents=[common, filters, bulk],
         help="Массовый запуск автонастройки через Action URI (AutoP)",
     )
     p_autop.set_defaults(func=cmd_autop)
@@ -425,7 +667,7 @@ def build_parser():
     # provision
     p_prov = subs.add_parser(
         "provision",
-        parents=[common],
+        parents=[common, filters, bulk],
         help="Массовый SIP NOTIFY check-sync",
     )
     p_prov.set_defaults(func=cmd_provision)
@@ -443,9 +685,9 @@ def resolve_workers(args, default):
     return default
 
 
-def main():
+def main(argv=None):
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # Для reboot/autop дефолт потоков — 20, для provision — 10
     if args.workers is None and args.command in ("reboot", "autop"):

@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yealink-park-manager"
+dynamic = ["version"]
+description = "Bulk reboot, autoprovision and SIP NOTIFY management for Yealink IP phones on FreePBX / Asterisk PJSIP."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "detroitwtf" }]
+requires-python = ">=3.8"
+dependencies = ["requests>=2.25.0"]
+keywords = ["yealink", "freepbx", "asterisk", "pjsip", "voip", "provisioning"]
+classifiers = [
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Communications :: Telephony",
+    "Topic :: System :: Systems Administration",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+yealink-manager = "yealink_manager:main"
+
+[project.urls]
+Homepage = "https://github.com/detroitwtf/yealink-park-manager"
+Issues = "https://github.com/detroitwtf/yealink-park-manager/issues"
+
+[tool.setuptools]
+py-modules = ["yealink_manager"]
+
+[tool.setuptools.dynamic]
+version = { attr = "yealink_manager.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B"]
+ignore = ["B904"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]

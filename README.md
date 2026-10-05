@@ -32,6 +32,9 @@ require any commercial modules such as Endpoint Manager.
   - [3. Bulk reboot](#3-bulk-reboot)
   - [4. Bulk autoprovision (AutoP)](#4-bulk-autoprovision-autop)
   - [5. SIP NOTIFY check-sync](#5-sip-notify-check-sync)
+  - [6. Inventory: list phones](#6-inventory-list-phones)
+  - [Filters](#filters)
+  - [Safety: dry run, confirmation, waves](#safety-dry-run-confirmation-waves)
 - [Typical scenarios](#typical-scenarios)
 - [Yealink phone configuration](#yealink-phone-configuration)
 - [Troubleshooting](#troubleshooting)
@@ -64,8 +67,12 @@ This tool solves three problems:
   a `User-Agent` filter → Yealink only.
 - 🔁 Three independent control channels: Action URI (`Reboot`, `AutoP`) and
   SIP NOTIFY (`check-sync`).
-- ⚡ Parallel delivery with configurable worker count.
-- 🧪 Single-phone test mode before bulk operations.
+- ⚡ Parallel delivery with configurable worker count, optionally in waves
+  (`--batch` / `--delay`) to avoid a re-registration storm.
+- 🧪 Single-phone test mode, `--dry-run` and a confirmation prompt before
+  bulk operations.
+- 🔎 Filters by extension, subnet and model; inventory table / JSON with
+  model and firmware.
 - 🔐 Credentials via CLI flags, environment variables or an interactive
   prompt — no default password.
 - 🐍 Only stdlib + `requests`.
@@ -85,6 +92,16 @@ This tool solves three problems:
 
 ## Installation
 
+With [pipx](https://pipx.pypa.io/) — installs the `yealink-manager` command:
+
+```bash
+apt update && apt install -y pipx
+pipx install git+https://github.com/detroitwtf/yealink-park-manager.git
+yealink-manager --version
+```
+
+Or as a single script:
+
 ```bash
 apt update && apt install -y python3-pip
 pip3 install requests
@@ -93,6 +110,9 @@ cd yealink-park-manager
 chmod +x yealink_manager.py
 ```
 
+The examples below use `./yealink_manager.py`; with pipx, replace it with
+`yealink-manager`.
+
 ---
 
 ## Usage
@@ -100,7 +120,7 @@ chmod +x yealink_manager.py
 ### CLI options
 
 ```
-yealink_manager.py [-h] {collect,test,reboot,autop,provision} ...
+yealink_manager.py [-h] [--version] {collect,list,test,reboot,autop,provision} ...
 
 Common options (available for every subcommand):
   -u, --user USER         Phone web UI username (default: admin)
@@ -111,6 +131,21 @@ Common options (available for every subcommand):
   -t, --timeout SEC       HTTP request timeout in seconds (default: 5)
   --ips-file PATH         File with IP list (default: yealink_ips.txt)
   --exts-file PATH        File with extensions (default: yealink_extensions.txt)
+
+Filters (collect, list, reboot, autop, provision):
+  --ext SPEC              Extensions: 4001,4005,4010-4020
+  --subnet CIDR[,CIDR]    Subnets: 10.1.0.0/16,10.2.0.0/24
+  --model TEXT            Model substring, case-insensitive: T33G
+
+Bulk options (reboot, autop, provision):
+  -n, --dry-run           Show targets, send nothing
+  -y, --yes               Skip confirmation (required without a terminal, e.g. cron)
+  --batch N               Send in waves of N devices
+  --delay SEC             Pause between waves (default: 0)
+  --failed-file PATH      Save failed IPs/extensions for a re-run
+
+list only:
+  --json                  JSON output
 ```
 
 ### Environment variables
@@ -129,7 +164,8 @@ sends the password in cleartext. Pass `--allow-http-fallback` to retry over
 HTTP only when the HTTPS connection fails.
 
 `reboot`, `autop` and `provision` exit with code `1` if at least one device
-failed, so cron and monitoring can detect partial failures.
+failed (or the operation was cancelled), so cron and monitoring can detect
+partial failures.
 
 ### 1. Collect the IP list
 
@@ -144,7 +180,7 @@ Expected output:
 
 ```
 [*] Запрос к базе данных Asterisk...
-[*] Строк /registrar/contact/: 984, распарсено JSON: 984, Yealink найдено: 983
+[*] Строк /registrar/contact/: 984, распарсено JSON: 984, Yealink найдено: 983 (endpoint'ов: 983)
 [+] Сохранено 983 IP в yealink_ips.txt
 ```
 
@@ -208,6 +244,58 @@ The tool collects Yealink extensions into `yealink_extensions.txt` and sends
 > **reboot** after receiving `check-sync`, not just re-provision. Check this
 > on one phone before running against the whole fleet.
 
+### 6. Inventory: list phones
+
+```bash
+./yealink_manager.py list
+```
+
+```
+EXT   IP           MODEL  FIRMWARE
+4001  10.0.0.1     T33G   124.86.0.75
+4002  10.0.0.2     T31P   124.86.0.40
+4003  10.1.0.4     W60B   77.85.0.25
+```
+
+Model and firmware are parsed from the `User-Agent`. For scripts:
+
+```bash
+./yealink_manager.py list --json > inventory.json
+```
+
+### Filters
+
+`--ext`, `--subnet` and `--model` work with `collect`, `list`, `reboot`,
+`autop` and `provision` and can be combined:
+
+```bash
+# AutoP only for T33G in one office
+./yealink_manager.py autop -p '...' --model T33G --subnet 10.1.0.0/16
+
+# check-sync for a range of extensions
+./yealink_manager.py provision --ext 4001-4099
+```
+
+For `reboot` / `autop`, `--ext` and `--model` read a fresh list from AstDB
+(the IP file has no extension or model); `--subnet` alone filters the IP file.
+
+### Safety: dry run, confirmation, waves
+
+```bash
+# See what would happen — nothing is sent
+./yealink_manager.py reboot --dry-run
+
+# Reboot in waves of 50 phones with a 30 s pause, save failures
+./yealink_manager.py reboot -p '...' --batch 50 --delay 30 --failed-file failed.txt
+
+# Re-run only the failed ones
+./yealink_manager.py reboot -p '...' --ips-file failed.txt
+```
+
+Before `reboot`, `autop` and `provision` the tool asks
+`Reboot 983 phones? [y/N]`. Without a terminal (cron, CI) it refuses to run
+unless `--yes` is given.
+
 ---
 
 ## Typical scenarios
@@ -227,8 +315,8 @@ The tool collects Yealink extensions into `yealink_extensions.txt` and sends
 # 4. Wait 10-15 minutes, check provisioning logs
 tail -50 /var/log/httpd/access_log
 
-# 5. Once the config has landed — reboot
-./yealink_manager.py reboot -p 'strong-pass'
+# 5. Once the config has landed — reboot in waves
+./yealink_manager.py reboot -p 'strong-pass' --batch 50 --delay 30
 ```
 
 ### Regular provisioning via cron
@@ -237,8 +325,11 @@ tail -50 /var/log/httpd/access_log
 # /etc/cron.d/yealink-provision
 
 # Nightly provisioning (collects the extension list itself, no password needed)
-0 3 * * * root cd /opt/yealink-park-manager && /usr/bin/python3 yealink_manager.py provision > /var/log/yealink-prov.log 2>&1
+0 3 * * * root cd /opt/yealink-park-manager && /usr/bin/python3 yealink_manager.py provision --yes --batch 100 --delay 10 > /var/log/yealink-prov.log 2>&1
 ```
+
+> `--yes` is required in cron: without a terminal the tool will not run a
+> bulk operation unconfirmed.
 
 ---
 
