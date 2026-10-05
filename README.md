@@ -1,5 +1,7 @@
 # yealink-park-manager
 
+**🇬🇧 English** | [🇷🇺 Русский](README.ru.md)
+
 > Bulk reboot, autoprovision and SIP NOTIFY management for **Yealink IP phones**
 > on **FreePBX / Asterisk PJSIP**.
 
@@ -13,8 +15,6 @@ are ignored) and lets you centrally:
 
 Designed for parks from a few dozen up to 1000+ devices, and it does not
 require any commercial modules such as Endpoint Manager.
-
-**Документация на русском:** [README.ru.md](README.ru.md)
 
 ---
 
