@@ -12,6 +12,11 @@ __pycache__/
 .venv/
 venv/
 .mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
 
 # IDE
 .vscode/
@@ -24,3 +29,5 @@ yealink_ips.txt
 yealink_extensions.txt
 autop_*.txt
 reboot_*.txt
+failed*.txt
+inventory.json

@@ -32,6 +32,9 @@ Grandstream и другие вендоры игнорируются) и позв
   - [3. Массовая перезагрузка](#3-массовая-перезагрузка)
   - [4. Массовая автонастройка (AutoP)](#4-массовая-автонастройка-autop)
   - [5. SIP NOTIFY check-sync](#5-sip-notify-check-sync)
+  - [6. Инвентаризация: список телефонов](#6-инвентаризация-список-телефонов)
+  - [Фильтры](#фильтры)
+  - [Безопасность запуска: dry run, подтверждение, волны](#безопасность-запуска-dry-run-подтверждение-волны)
 - [Типовые сценарии](#типовые-сценарии)
 - [Настройка телефонов Yealink](#настройка-телефонов-yealink)
 - [Troubleshooting](#troubleshooting)
@@ -64,8 +67,12 @@ Grandstream и другие вендоры игнорируются) и позв
   по `User-Agent` → только Yealink.
 - 🔁 Три независимых канала управления: Action URI (`Reboot`, `AutoP`)
   и SIP NOTIFY (`check-sync`).
-- ⚡ Параллельная отправка с настраиваемым числом потоков.
-- 🧪 Режим теста на одном телефоне перед массовым прогоном.
+- ⚡ Параллельная отправка с настраиваемым числом потоков, при желании —
+  волнами (`--batch` / `--delay`), чтобы не устроить шторм перерегистраций.
+- 🧪 Тест на одном телефоне, `--dry-run` и запрос подтверждения перед
+  массовым прогоном.
+- 🔎 Фильтры по extension, подсети и модели; таблица / JSON с моделью
+  и прошивкой для инвентаризации.
 - 🔐 Учётные данные через флаги CLI, переменные окружения или
   интерактивный запрос — пароля по умолчанию нет.
 - 🐍 Только stdlib + `requests`.
@@ -85,6 +92,16 @@ Grandstream и другие вендоры игнорируются) и позв
 
 ## Установка
 
+Через [pipx](https://pipx.pypa.io/) — появится команда `yealink-manager`:
+
+```bash
+apt update && apt install -y pipx
+pipx install git+https://github.com/detroitwtf/yealink-park-manager.git
+yealink-manager --version
+```
+
+Или одним скриптом:
+
 ```bash
 apt update && apt install -y python3-pip
 pip3 install requests
@@ -93,6 +110,9 @@ cd yealink-park-manager
 chmod +x yealink_manager.py
 ```
 
+В примерах ниже используется `./yealink_manager.py`; при установке через
+pipx замените на `yealink-manager`.
+
 ---
 
 ## Использование
@@ -100,7 +120,7 @@ chmod +x yealink_manager.py
 ### Опции CLI
 
 ```
-yealink_manager.py [-h] {collect,test,reboot,autop,provision} ...
+yealink_manager.py [-h] [--version] {collect,list,test,reboot,autop,provision} ...
 
 Общие опции (доступны для каждой подкоманды):
   -u, --user USER         Логин веб-интерфейса телефона (по умолчанию: admin)
@@ -111,6 +131,21 @@ yealink_manager.py [-h] {collect,test,reboot,autop,provision} ...
   -t, --timeout SEC       Таймаут HTTP-запроса в секундах (по умолчанию: 5)
   --ips-file PATH         Файл со списком IP (по умолчанию: yealink_ips.txt)
   --exts-file PATH        Файл со списком extension'ов (по умолчанию: yealink_extensions.txt)
+
+Фильтры (collect, list, reboot, autop, provision):
+  --ext SPEC              Extension'ы: 4001,4005,4010-4020
+  --subnet CIDR[,CIDR]    Подсети: 10.1.0.0/16,10.2.0.0/24
+  --model TEXT            Подстрока модели без учёта регистра: T33G
+
+Массовые операции (reboot, autop, provision):
+  -n, --dry-run           Показать цели, ничего не отправлять
+  -y, --yes               Без подтверждения (обязательно без терминала, напр. в cron)
+  --batch N               Отправлять волнами по N устройств
+  --delay SEC             Пауза между волнами (по умолчанию: 0)
+  --failed-file PATH      Сохранить неудачные IP/extension'ы для повторного прогона
+
+Только для list:
+  --json                  Вывод в JSON
 ```
 
 ### Переменные окружения
@@ -129,7 +164,8 @@ yealink_manager.py [-h] {collect,test,reboot,autop,provision} ...
 HTTP только если HTTPS-соединение не установилось.
 
 `reboot`, `autop` и `provision` завершаются с кодом `1`, если хотя бы одно
-устройство не ответило успешно, — это видно в cron и мониторинге.
+устройство не ответило успешно (или операция отменена), — это видно в cron
+и мониторинге.
 
 ### 1. Сбор списка IP
 
@@ -144,7 +180,7 @@ HTTP только если HTTPS-соединение не установило�
 
 ```
 [*] Запрос к базе данных Asterisk...
-[*] Строк /registrar/contact/: 984, распарсено JSON: 984, Yealink найдено: 983
+[*] Строк /registrar/contact/: 984, распарсено JSON: 984, Yealink найдено: 983 (endpoint'ов: 983)
 [+] Сохранено 983 IP в yealink_ips.txt
 ```
 
@@ -208,6 +244,58 @@ HTTP-доступа к телефону и пароля веб-интерфей�
 > `check-sync` может **перезагрузиться**, а не только обновить конфиг.
 > Проверьте на одном телефоне перед запуском на весь парк.
 
+### 6. Инвентаризация: список телефонов
+
+```bash
+./yealink_manager.py list
+```
+
+```
+EXT   IP           MODEL  FIRMWARE
+4001  10.0.0.1     T33G   124.86.0.75
+4002  10.0.0.2     T31P   124.86.0.40
+4003  10.1.0.4     W60B   77.85.0.25
+```
+
+Модель и прошивка берутся из `User-Agent`. Для скриптов:
+
+```bash
+./yealink_manager.py list --json > inventory.json
+```
+
+### Фильтры
+
+`--ext`, `--subnet` и `--model` работают в `collect`, `list`, `reboot`,
+`autop` и `provision`, их можно комбинировать:
+
+```bash
+# AutoP только для T33G в одном офисе
+./yealink_manager.py autop -p '...' --model T33G --subnet 10.1.0.0/16
+
+# check-sync для диапазона номеров
+./yealink_manager.py provision --ext 4001-4099
+```
+
+Для `reboot` / `autop` фильтры `--ext` и `--model` заново читают список из
+AstDB (в файле IP нет номеров и моделей); один `--subnet` фильтрует файл IP.
+
+### Безопасность запуска: dry run, подтверждение, волны
+
+```bash
+# Посмотреть, что будет сделано — ничего не отправляется
+./yealink_manager.py reboot --dry-run
+
+# Перезагрузка волнами по 50 телефонов с паузой 30 с, неудачные — в файл
+./yealink_manager.py reboot -p '...' --batch 50 --delay 30 --failed-file failed.txt
+
+# Повторить только неудачные
+./yealink_manager.py reboot -p '...' --ips-file failed.txt
+```
+
+Перед `reboot`, `autop` и `provision` инструмент спрашивает
+`Перезагрузить 983 телефонов? [y/N]`. Без терминала (cron, CI) он
+откажется запускаться, если не указан `--yes`.
+
 ---
 
 ## Типовые сценарии
@@ -227,8 +315,8 @@ HTTP-доступа к телефону и пароля веб-интерфей�
 # 4. Подождать 10-15 минут, проверить логи провижининга
 tail -50 /var/log/httpd/access_log
 
-# 5. Когда конфиг доехал — перезагрузить
-./yealink_manager.py reboot -p 'strong-pass'
+# 5. Когда конфиг доехал — перезагрузить волнами
+./yealink_manager.py reboot -p 'strong-pass' --batch 50 --delay 30
 ```
 
 ### Регулярный провижининг через cron
@@ -237,8 +325,11 @@ tail -50 /var/log/httpd/access_log
 # /etc/cron.d/yealink-provision
 
 # Ночной провижининг (список extension'ов собирается сам, пароль не нужен)
-0 3 * * * root cd /opt/yealink-park-manager && /usr/bin/python3 yealink_manager.py provision > /var/log/yealink-prov.log 2>&1
+0 3 * * * root cd /opt/yealink-park-manager && /usr/bin/python3 yealink_manager.py provision --yes --batch 100 --delay 10 > /var/log/yealink-prov.log 2>&1
 ```
+
+> В cron обязателен `--yes`: без терминала массовая операция без
+> подтверждения не запустится.
 
 ---
 
