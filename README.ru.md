@@ -1,5 +1,7 @@
 # yealink-park-manager
 
+[🇬🇧 English](README.md) | **🇷🇺 Русский**
+
 > Массовая перезагрузка, автонастройка и SIP NOTIFY для **Yealink-телефонов**
 > на **FreePBX / Asterisk PJSIP**.
 
@@ -13,8 +15,6 @@ Grandstream и другие вендоры игнорируются) и позв
 
 Рассчитан на парки от нескольких десятков до 1000+ аппаратов и не требует
 установки коммерческих модулей вроде Endpoint Manager.
-
-**Documentation in English:** [README.md](README.md)
 
 ---
 
