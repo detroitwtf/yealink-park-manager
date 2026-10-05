@@ -66,7 +66,8 @@ This tool solves three problems:
   SIP NOTIFY (`check-sync`).
 - ⚡ Parallel delivery with configurable worker count.
 - 🧪 Single-phone test mode before bulk operations.
-- 🔐 Credentials via CLI flags or environment variables — nothing hardcoded.
+- 🔐 Credentials via CLI flags, environment variables or an interactive
+  prompt — no default password.
 - 🐍 Only stdlib + `requests`.
 
 ---
@@ -87,7 +88,7 @@ This tool solves three problems:
 ```bash
 apt update && apt install -y python3-pip
 pip3 install requests
-git clone https://github.com/<your-login>/yealink-park-manager.git
+git clone https://github.com/detroitwtf/yealink-park-manager.git
 cd yealink-park-manager
 chmod +x yealink_manager.py
 ```
@@ -103,8 +104,9 @@ yealink_manager.py [-h] {collect,test,reboot,autop,provision} ...
 
 Common options (available for every subcommand):
   -u, --user USER         Phone web UI username (default: admin)
-  -p, --password PASS     Phone web UI password (default: admin)
+  -p, --password PASS     Phone web UI password (prompted if not set)
   -s, --scheme {http,https}   Access scheme (default: https)
+  --allow-http-fallback   Retry over plain HTTP if HTTPS is unreachable
   -w, --workers N         Number of parallel workers
   -t, --timeout SEC       HTTP request timeout in seconds (default: 5)
   --ips-file PATH         File with IP list (default: yealink_ips.txt)
@@ -116,11 +118,18 @@ Common options (available for every subcommand):
 | Variable | Default | Description |
 |---|---|---|
 | `YEALINK_USER` | `admin` | Phone web UI username |
-| `YEALINK_PASSWORD` | `admin` | Phone web UI password |
-| `YEALINK_SCHEME` | `https` | `https` or `http` (with fallback) |
+| `YEALINK_PASSWORD` | — | Phone web UI password (prompted if not set) |
+| `YEALINK_SCHEME` | `https` | `https` or `http` |
 | `MAX_WORKERS` | `20` / `10` | Number of parallel workers |
 
 CLI flags take precedence over environment variables.
+
+By default there is **no** HTTPS → HTTP fallback: with Basic Auth, plain HTTP
+sends the password in cleartext. Pass `--allow-http-fallback` to retry over
+HTTP only when the HTTPS connection fails.
+
+`reboot`, `autop` and `provision` exit with code `1` if at least one device
+failed, so cron and monitoring can detect partial failures.
 
 ### 1. Collect the IP list
 
@@ -195,6 +204,10 @@ The tool collects Yealink extensions into `yealink_extensions.txt` and sends
 
 > Requires `features.sip_notify.enable = 1` on the phone.
 
+> ⚠️ Depending on the phone setting `sip.notify_reboot_enable`, Yealink may
+> **reboot** after receiving `check-sync`, not just re-provision. Check this
+> on one phone before running against the whole fleet.
+
 ---
 
 ## Typical scenarios
@@ -223,11 +236,8 @@ tail -50 /var/log/httpd/access_log
 ```cron
 # /etc/cron.d/yealink-provision
 
-# Refresh IP list hourly
-0 * * * * root cd /opt/yealink-park-manager && /usr/bin/python3 yealink_manager.py collect > /dev/null 2>&1
-
-# Nightly provisioning
-0 3 * * * root cd /opt/yealink-park-manager && /usr/bin/python3 yealink_manager.py provision -p '...' > /var/log/yealink-prov.log 2>&1
+# Nightly provisioning (collects the extension list itself, no password needed)
+0 3 * * * root cd /opt/yealink-park-manager && /usr/bin/python3 yealink_manager.py provision > /var/log/yealink-prov.log 2>&1
 ```
 
 ---
@@ -302,7 +312,7 @@ If the output is empty, no phones are registered (this is not a script issue).
 If the output is non-empty but has no `user_agent` or `via_addr`, please
 paste an example line into an issue — we'll add support for that format.
 
-### `pjsip send notify check-sync` says "No such notification"
+### `pjsip send notify check-sync` says "Unable to find notify type 'check-sync'"
 
 The `check-sync` event is not defined for PJSIP in FreePBX.
 
@@ -313,7 +323,7 @@ The `check-sync` event is not defined for PJSIP in FreePBX.
 Event => check-sync
 ```
 
-Then run `asterisk -rx "pjsip reload"`.
+Then run `asterisk -rx "module reload res_pjsip_notify.so"`.
 
 ---
 

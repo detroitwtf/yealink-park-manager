@@ -66,8 +66,8 @@ Grandstream и другие вендоры игнорируются) и позв
   и SIP NOTIFY (`check-sync`).
 - ⚡ Параллельная отправка с настраиваемым числом потоков.
 - 🧪 Режим теста на одном телефоне перед массовым прогоном.
-- 🔐 Учётные данные через флаги CLI или переменные окружения —
-  ничего не хардкодится.
+- 🔐 Учётные данные через флаги CLI, переменные окружения или
+  интерактивный запрос — пароля по умолчанию нет.
 - 🐍 Только stdlib + `requests`.
 
 ---
@@ -88,7 +88,7 @@ Grandstream и другие вендоры игнорируются) и позв
 ```bash
 apt update && apt install -y python3-pip
 pip3 install requests
-git clone https://github.com/<ваш-логин>/yealink-park-manager.git
+git clone https://github.com/detroitwtf/yealink-park-manager.git
 cd yealink-park-manager
 chmod +x yealink_manager.py
 ```
@@ -104,8 +104,9 @@ yealink_manager.py [-h] {collect,test,reboot,autop,provision} ...
 
 Общие опции (доступны для каждой подкоманды):
   -u, --user USER         Логин веб-интерфейса телефона (по умолчанию: admin)
-  -p, --password PASS     Пароль веб-интерфейса (по умолчанию: admin)
+  -p, --password PASS     Пароль веб-интерфейса (если не задан — запрашивается)
   -s, --scheme {http,https}   Схема доступа (по умолчанию: https)
+  --allow-http-fallback   Повторить по HTTP, если HTTPS недоступен
   -w, --workers N         Число параллельных потоков
   -t, --timeout SEC       Таймаут HTTP-запроса в секундах (по умолчанию: 5)
   --ips-file PATH         Файл со списком IP (по умолчанию: yealink_ips.txt)
@@ -117,11 +118,18 @@ yealink_manager.py [-h] {collect,test,reboot,autop,provision} ...
 | Переменная | По умолчанию | Назначение |
 |---|---|---|
 | `YEALINK_USER` | `admin` | Логин веб-интерфейса телефона |
-| `YEALINK_PASSWORD` | `admin` | Пароль веб-интерфейса |
-| `YEALINK_SCHEME` | `https` | `https` или `http` (с фолбэком) |
+| `YEALINK_PASSWORD` | — | Пароль веб-интерфейса (если не задан — запрашивается) |
+| `YEALINK_SCHEME` | `https` | `https` или `http` |
 | `MAX_WORKERS` | `20` / `10` | Число параллельных потоков |
 
 Флаги CLI имеют приоритет над переменными окружения.
+
+По умолчанию отката с HTTPS на HTTP **нет**: при Basic Auth по HTTP пароль
+уходит открытым текстом. Флаг `--allow-http-fallback` разрешает повтор по
+HTTP только если HTTPS-соединение не установилось.
+
+`reboot`, `autop` и `provision` завершаются с кодом `1`, если хотя бы одно
+устройство не ответило успешно, — это видно в cron и мониторинге.
 
 ### 1. Сбор списка IP
 
@@ -196,6 +204,10 @@ HTTP-доступа к телефону и пароля веб-интерфей�
 
 > Требует `features.sip_notify.enable = 1` на телефоне.
 
+> ⚠️ В зависимости от параметра `sip.notify_reboot_enable` Yealink после
+> `check-sync` может **перезагрузиться**, а не только обновить конфиг.
+> Проверьте на одном телефоне перед запуском на весь парк.
+
 ---
 
 ## Типовые сценарии
@@ -224,11 +236,8 @@ tail -50 /var/log/httpd/access_log
 ```cron
 # /etc/cron.d/yealink-provision
 
-# Обновление списка IP каждый час
-0 * * * * root cd /opt/yealink-park-manager && /usr/bin/python3 yealink_manager.py collect > /dev/null 2>&1
-
-# Ночной провижининг
-0 3 * * * root cd /opt/yealink-park-manager && /usr/bin/python3 yealink_manager.py provision -p '...' > /var/log/yealink-prov.log 2>&1
+# Ночной провижининг (список extension'ов собирается сам, пароль не нужен)
+0 3 * * * root cd /opt/yealink-park-manager && /usr/bin/python3 yealink_manager.py provision > /var/log/yealink-prov.log 2>&1
 ```
 
 ---
@@ -306,7 +315,7 @@ asterisk -rx "database show registrar contact" | head -3
 Если вывод есть, но в строках нет `user_agent` или `via_addr` —
 пришлите пример строки в issue, добавим поддержку формата.
 
-### `pjsip send notify check-sync` возвращает "No such notification"
+### `pjsip send notify check-sync` возвращает "Unable to find notify type 'check-sync'"
 
 В FreePBX не определён event `check-sync` для PJSIP.
 
@@ -317,7 +326,7 @@ asterisk -rx "database show registrar contact" | head -3
 Event => check-sync
 ```
 
-И выполните `asterisk -rx "pjsip reload"`.
+И выполните `asterisk -rx "module reload res_pjsip_notify.so"`.
 
 ---
 
